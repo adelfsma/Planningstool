@@ -38,6 +38,12 @@ st.sidebar.header("Basis instellingen")
 max_m2 = st.sidebar.number_input("Max m² per dag", value=2000, step=100, min_value=1)
 max_kleuren = st.sidebar.number_input("Max kleuren per dag", value=18, step=1, min_value=1)
 
+st.sidebar.subheader("Vrijdagcapaciteit (afwijkend)")
+use_friday_override = st.sidebar.checkbox("Gebruik afwijkende capaciteit op vrijdag", value=True)
+friday_max_m2 = st.sidebar.number_input("Max m² op vrijdag", value=1600, step=100, min_value=1)
+friday_max_kleuren = st.sidebar.number_input("Max kleuren op vrijdag", value=13, step=1, min_value=1)
+
+
 st.sidebar.subheader("Leverdatum buffer (plandatum vóór leverdatum)")
 min_dagen_voor_lever = st.sidebar.number_input(
     "Minimaal # dagen vóór leverdatum (hard)", value=2, step=1, min_value=2,
@@ -50,6 +56,7 @@ pref_dagen_voor_lever = st.sidebar.number_input(
 
 st.sidebar.subheader("Fixeren")
 fixeer_morgen = st.sidebar.checkbox("Fixeer ook morgen", value=True, help="Vandaag en eerder zijn altijd gefixeerd. Met dit vinkje wordt morgen ook op slot gezet.")
+fixeer_overmorgen = st.sidebar.checkbox("Fixeer ook overmorgen", value=False, help="Zet ook overmorgen op slot (geen herplanning / geen nieuwe orders op die dag).")
 
 st.sidebar.subheader("Kalender")
 exclude_weekends = st.sidebar.checkbox("Weekenden uitsluiten", value=True)
@@ -155,6 +162,16 @@ def make_working_days(start, end, excl_weekends, holidays_set, excl_holidays):
         out.append(dn)
     return out
 
+
+
+def get_day_caps(d: pd.Timestamp):
+    """Return (cap_m2, cap_kleuren) for a given day."""
+    # Friday = weekday 4 (Mon=0)
+    if use_friday_override and d.weekday() == 4:
+        return int(friday_max_m2), int(friday_max_kleuren)
+    return int(max_m2), int(max_kleuren)
+
+
 def safe_bool(x):
     # Excel can contain True/False, 1/0, 'WAAR'/'ONWAAR'
     if isinstance(x, bool):
@@ -195,11 +212,14 @@ df["_BinnenBool"] = df["Binnen"].apply(safe_bool)
 
 vandaag = pd.Timestamp.today().normalize()
 morgen = vandaag + timedelta(days=1)
+overmorgen = vandaag + timedelta(days=2)
 
 # Fix rules
 df["Gefixeerd"] = df["PlanDatum"].dt.normalize() <= vandaag
 if fixeer_morgen:
     df.loc[df["PlanDatum"].dt.normalize() == morgen, "Gefixeerd"] = True
+if fixeer_overmorgen:
+    df.loc[df["PlanDatum"].dt.normalize() == overmorgen, "Gefixeerd"] = True
 
 # Locked days set (days that are fixed horizon = on slot)
 locked_days = set(df.loc[df["Gefixeerd"], "PlanDatum"].dt.normalize().dropna().unique())
@@ -234,7 +254,8 @@ overload_days = []
 for d in sorted(locked_days):
     m2d = float(fixed_m2.get(d, 0.0))
     cd = int(fixed_colors.get(d, 0))
-    if m2d > max_m2 or cd > max_kleuren:
+    cap_m2_d, cap_k_d = get_day_caps(pd.Timestamp(d))
+    if m2d > cap_m2_d or cd > cap_k_d:
         overload_days.append((d, m2d, cd))
 
 if overload_days:
@@ -293,18 +314,20 @@ def solve_heuristic(df_in: pd.DataFrame):
         best = None
         for d in feas_days:
             m2 = float(row["M2"])
-            if day_m2[d] + m2 > max_m2:
+            cap_m2_d, cap_k_d = get_day_caps(pd.Timestamp(d))
+            if day_m2[d] + m2 > cap_m2_d:
                 continue
             # color count check
             colors = day_colors[d]
             new_color = row["Kleur"] not in colors
-            if (len(colors) + (1 if new_color else 0)) > max_kleuren:
+            cap_m2_d, cap_k_d = get_day_caps(pd.Timestamp(d))
+            if (len(colors) + (1 if new_color else 0)) > cap_k_d:
                 continue
 
             after_pref = 1 if d > pref_latest else 0
             # prefer not adding a new color, and prefer fuller blocks (more m2 already on that color)
             add_color = 1 if new_color else 0
-            remcap = (max_m2 - (day_m2[d] + m2))  # smaller is better
+            remcap = (cap_m2_d - (day_m2[d] + m2))  # smaller is better
             score = (after_pref, add_color, remcap)
 
             if best is None or score < best[0]:
@@ -363,7 +386,8 @@ def solve_cpsat(df_in: pd.DataFrame):
         for i in var_idx:
             m2 = int(round(float(dfi.at[i,"M2"])))
             m2_terms.append(m2 * x[(i,t)])
-        model.Add(sum(m2_terms) + int(round(fixed_m2_arr[t])) <= int(max_m2))
+        cap_m2_t, cap_k_t = get_day_caps(days[t])
+        model.Add(sum(m2_terms) + int(round(fixed_m2_arr[t])) <= int(cap_m2_t))
 
     # Color usage vars y[k,t]
     y = {}
@@ -385,7 +409,8 @@ def solve_cpsat(df_in: pd.DataFrame):
 
     # Max colors per day
     for t in range(T):
-        model.Add(sum(y[(k,t)] for k in range(K)) <= int(max_kleuren))
+        cap_m2_t, cap_k_t = get_day_caps(days[t])
+        model.Add(sum(y[(k,t)] for k in range(K)) <= int(cap_k_t))
 
     # Feasibility windows (calendar + receipt + deadline)
     for i in var_idx:
@@ -535,8 +560,8 @@ dagsamenvatting["m2"] = dagsamenvatting["m2_gefixeerd"].astype(float) + dagsamen
 d_tot_colors = day_base.groupby("Dag")["Kleur"].nunique().rename("Kleuren").reset_index()
 dagsamenvatting = dagsamenvatting.merge(d_tot_colors, on="Dag", how="left")
 
-dagsamenvatting["Over_m2"] = dagsamenvatting["m2"] > float(max_m2)
-dagsamenvatting["Over_kleuren"] = dagsamenvatting["Kleuren"] > int(max_kleuren)
+dagsamenvatting["Over_m2"] = dagsamenvatting.apply(lambda r: r["m2"] > float(get_day_caps(pd.Timestamp(r["Dag"]))[0]), axis=1)
+dagsamenvatting["Over_kleuren"] = dagsamenvatting.apply(lambda r: r["Kleuren"] > int(get_day_caps(pd.Timestamp(r["Dag"]))[1]), axis=1)
 
 dagsamenvatting = dagsamenvatting.sort_values("Dag")
 
