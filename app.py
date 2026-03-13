@@ -15,8 +15,11 @@ try:
 except Exception:
     ORTOOLS_OK = False
 
-st.set_page_config(page_title="Coatinc De Meern - Planning Optimizer", layout="wide")
-st.title("Coatinc De Meern - Planning Optimizer v18.7")
+APP_VERSION = "19.4"
+APP_TITLE = f"Coatinc De Meern - Planning Optimizer v{APP_VERSION}"
+
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
 
 # --- Branding ---
 _logo_path = os.path.join(os.path.dirname(__file__), "assets", "coatinc_logo.png")
@@ -219,6 +222,13 @@ def parse_holidays(txt: str) -> set[pd.Timestamp]:
         except Exception:
             pass
     return dates
+
+
+def drop_deelorder_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+    if df_in is None:
+        return df_in
+    cols = [c for c in df_in.columns if "deelorder" not in str(c).lower()]
+    return df_in[cols]
 
 
 def fmt_m2(x):
@@ -691,6 +701,34 @@ else:
     late["Reden"] = ""
 
 
+
+LATE_REMOVE_COLS = [
+    "DeelorderID", "DeelOrderDienstID", "ProduktieLijn", "LeverUur", "IngeplandDoorID",
+    "StatusDiensten", "StatusDienstenGereed", "Omschrijving", "PoederID", "Brightness",
+    "MaxDikte", "LeverDatumTypeID", "MateriaalSoort", "AantalLagenPoedercoating", "Uren",
+    "ProduktielijnID", "Trav", "Poed", "Omzet", "PlanstatusDefinitief", "M2_Def",
+    "Uren_Def", "Trav_Def", "Poed_Def", "Omzet_Def", "Kleurbitmap", "Gereed", "Colli",
+    "Vak", "Lgn", "Grond", "Stralen", "StralenGereed", "Poetsen", "PoetsenGereed",
+    "LeverDatumTypeAfkorting", "VoorkeurLaatsteDag", "VroegsteDag",
+    "Regel_5WerkdagenVanToepassing", "HardDeadlineOK", "OrderTypeAfkorting"
+]
+
+def compact_late_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+    if df_in is None or len(df_in.columns) == 0:
+        return df_in
+    df_out = df_in.copy()
+    keep_cols = [c for c in df_out.columns if c not in LATE_REMOVE_COLS]
+    df_out = df_out[keep_cols]
+
+    ordered_front = [
+        "OrderID", "Naam", "ReferentieKlant", "Kleur", "M2", "LeverDatum", "Reden",
+        "OudePlanDatum", "AdviesPlanDatum", "AdviesLeverDatum", "AdviesToelichting", "Ralzoekcode",
+        "WerkdagenTeLaat", "AdviesActie"
+    ]
+    front = [c for c in ordered_front if c in df_out.columns]
+    rest = [c for c in df_out.columns if c not in front]
+    return df_out[front + rest]
+
 def build_late_advice(df_all: pd.DataFrame, late_df: pd.DataFrame) -> pd.DataFrame:
     late_out = late_df.copy()
     if len(late_out) == 0:
@@ -839,8 +877,29 @@ kleurblokken = (
     .sort_values(["Dag", "m2"], ascending=[True, False])
 )
 
+kleurbelasting_week = pd.DataFrame()
+if len(day_base):
+    week_base = day_base.copy()
+    iso = week_base["Dag"].dt.isocalendar()
+    week_base["Jaar"] = iso.year.astype(int)
+    week_base["WeekNr"] = iso.week.astype(int)
+    kleurbelasting_week = (
+        week_base.groupby(["Jaar", "WeekNr", "Kleur"], dropna=False)
+        .agg(
+            Orders=("OrderID", "count"),
+            m2=("M2", "sum"),
+            DagenGepland=("Dag", pd.Series.nunique),
+            EersteDag=("Dag", "min"),
+            LaatsteDag=("Dag", "max"),
+        )
+        .reset_index()
+        .sort_values(["Jaar", "WeekNr", "m2", "Kleur"], ascending=[True, True, False, True])
+    )
+    kleurbelasting_week["Week"] = kleurbelasting_week["Jaar"].astype(str) + "-W" + kleurbelasting_week["WeekNr"].astype(str).str.zfill(2)
+
 # ---------- Planner-friendly replan views ----------
 verplaatsblokken = pd.DataFrame()
+verplaatsblokken_kleur = pd.DataFrame()
 if len(herpland):
     verplaatsblokken = (
         herpland.groupby(["OudePlanDatum", "NieuwePlanDatum", "Verplaatsrichting"], dropna=False)
@@ -849,7 +908,6 @@ if len(herpland):
             Kleuren=("Kleur", pd.Series.nunique),
             m2=("M2", "sum"),
             OrderIDs=("OrderID", lambda s: ", ".join(map(str, pd.Series(s).astype(str).tolist()))),
-            Deelorders=("DeelorderID", lambda s: ", ".join(pd.Series(s).dropna().astype(str).tolist()) if "DeelorderID" in herpland.columns else ""),
         )
         .reset_index()
         .sort_values(["OudePlanDatum", "NieuwePlanDatum"])
@@ -860,16 +918,34 @@ if len(herpland):
         + " naar " + verplaatsblokken["NieuwePlanDatum"].dt.strftime("%d-%m-%Y")
     )
 
+    verplaatsblokken_kleur = (
+        herpland.groupby(["Kleur", "OudePlanDatum", "NieuwePlanDatum", "Verplaatsrichting"], dropna=False)
+        .agg(
+            Orders=("OrderID", "count"),
+            m2=("M2", "sum"),
+            OrderIDs=("OrderID", lambda s: ", ".join(map(str, pd.Series(s).astype(str).tolist()))),
+            Klanten=("ReferentieKlant", lambda s: ", ".join(pd.Series(s).dropna().astype(str).unique().tolist()[:6])) if "ReferentieKlant" in herpland.columns else ("OrderID", lambda s: ""),
+        )
+        .reset_index()
+        .sort_values(["OudePlanDatum", "Kleur", "NieuwePlanDatum"], na_position="last")
+    )
+    verplaatsblokken_kleur["Actieblok"] = (
+        "Kleur " + verplaatsblokken_kleur["Kleur"].astype(str)
+        + ": " + verplaatsblokken_kleur["Orders"].astype(int).astype(str)
+        + " order(s) van " + verplaatsblokken_kleur["OudePlanDatum"].dt.strftime("%d-%m-%Y")
+        + " naar " + verplaatsblokken_kleur["NieuwePlanDatum"].dt.strftime("%d-%m-%Y")
+    )
+
 actie_cols = [
     "Actie", "Verplaatsgroep", "OudePlanDatum", "NieuwePlanDatum", "Verschil_dagen", "Verplaatsrichting",
-    "Naam", "OrderID", "DeelorderID", "VolgNr", "Kleur", "M2", "LeverDatum", "LaatsteToegestaneDag",
+    "Naam", "OrderID", "VolgNr", "Kleur", "M2", "LeverDatum", "LaatsteToegestaneDag",
     "VroegsteDag", "Binnen", "Regel_5WerkdagenVanToepassing", "ReferentieKlant", "Omschrijving"
 ]
 herpland_actie = herpland.copy()
 actie_cols = [c for c in actie_cols if c in herpland_actie.columns]
 herpland_actie = herpland_actie[actie_cols]
 if len(herpland_actie):
-    herpland_actie = herpland_actie.sort_values([c for c in ["OudePlanDatum", "NieuwePlanDatum", "Kleur", "OrderID"] if c in herpland_actie.columns]).reset_index(drop=True)
+    herpland_actie = herpland_actie.sort_values([c for c in ["OudePlanDatum", "Kleur", "NieuwePlanDatum", "OrderID"] if c in herpland_actie.columns]).reset_index(drop=True)
     herpland_actie.insert(0, "Volgorde", range(1, len(herpland_actie) + 1))
 
 # ---------- UI ----------
@@ -897,8 +973,8 @@ with st.expander("Toelichting planningsregels"):
     st.write("- **Binnen = waar**: order mag eerder gestart worden dan deze 5-werkdagenregel.")
     st.write("- **AanleverDatum wordt niet meer gebruikt** in de planning.")
 
-resultaat_tab, herplan_tab, detail_tab, niet_planbaar_tab, instellingen_tab = st.tabs(
-    ["Resultaat", "Te herplannen orders", "Detailplanning", "Niet planbaar + advies", "Instellingen"]
+resultaat_tab, verplaatskleur_tab, herplan_tab, detail_tab, niet_planbaar_tab, instellingen_tab = st.tabs(
+    ["Resultaat", "Verplaatsblokken op kleur", "Te herplannen orders", "Detailplanning", "Niet planbaar + advies", "Instellingen"]
 )
 
 with resultaat_tab:
@@ -915,21 +991,46 @@ with resultaat_tab:
     render_df(dagsamenvatting_view[show_cols], height=420)
 
     st.markdown("### Kleurblokken per dag")
-    kleurblokken_view = fmt_df_m2(kleurblokken.copy(), ["m2"])
+    kleurblokken_view = drop_deelorder_columns(fmt_df_m2(kleurblokken.copy(), ["m2"]))
     render_df(kleurblokken_view, height=420)
+
+    st.markdown("### Kleurbelasting per week")
+    st.caption("Overzicht van kleurbelasting per weeknummer, zodat de planner snel ziet welke kleuren per week de grootste blokken vormen.")
+    if len(kleurbelasting_week) == 0:
+        st.info("Geen kleurbelasting per week beschikbaar.")
+    else:
+        kbw_view = fmt_df_m2(kleurbelasting_week.copy(), ["m2"])
+        kbw_cols = ["Week", "WeekNr", "Kleur", "Orders", "m2", "DagenGepland", "EersteDag", "LaatsteDag"]
+        kbw_cols = [c for c in kbw_cols if c in kbw_view.columns]
+        render_df(kbw_view[kbw_cols], height=420)
+
+with verplaatskleur_tab:
+    st.markdown("### Verplaatsblokken op kleur")
+    st.caption("Sortering: eerst oude plandatum, daarbinnen op kleur en daarna op nieuwe plandatum. Zo blijft de dagvolgorde leidend voor de planner.")
+    if len(herpland) == 0:
+        st.success("Geen orders herpland.")
+    else:
+        vbk_view = fmt_df_m2(verplaatsblokken_kleur.copy(), ["m2"])
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Kleurblokken", len(vbk_view))
+        k2.metric("Te verplaatsen orders", int(vbk_view["Orders"].sum()) if "Orders" in vbk_view.columns else 0)
+        k3.metric("Te verplaatsen m²", fmt_m2(float(vbk_view["m2"].astype(str).str.replace(",", ".", regex=False).astype(float).sum())) if "m2" in vbk_view.columns and len(vbk_view) else "0,0")
+        vbk_cols = ["Actieblok", "OudePlanDatum", "Kleur", "NieuwePlanDatum", "Verplaatsrichting", "Orders", "m2", "Klanten", "OrderIDs"]
+        vbk_cols = [c for c in vbk_cols if c in vbk_view.columns]
+        render_df(vbk_view[vbk_cols], height=420)
 
 with herplan_tab:
     st.markdown("### Nieuwe opzet voor de planner")
     st.write(
         "Dit tabblad is opgezet voor de werkwijze waarbij orders **één voor één** worden verschoven. "
-        "Werk eerst de **verplaatsblokken** af (van oude dag naar nieuwe dag), en loop daarna de **order-actielijst** in die volgorde door."
+        "Werk eerst per **oude plandatum** en daarna binnen die dag op **kleur**. Loop daarna de **order-actielijst** in die volgorde door."
     )
     st.markdown(
         f"""
         <div class='planner-card'>
         <b>Praktische werkwijze voor de planner</b><br>
-        1. Sorteer op <b>oude dag → nieuwe dag</b>.<br>
-        2. Werk per verplaatsblok alle orders af.<br>
+        1. Sorteer op <b>oude plandatum</b>.<br>
+        2. Werk daarbinnen op <b>kleur</b> en daarna per <b>oude dag → nieuwe dag</b> alle orders af.<br>
         3. Gebruik daarna de actielijst als afvinklijst voor handmatige verplaatsing in het planningssysteem.
         </div>
         """,
@@ -939,28 +1040,26 @@ with herplan_tab:
     if len(herpland) == 0:
         st.success("Geen orders herpland.")
     else:
-        st.markdown("#### 1) Verplaatsblokken (werk per bron- en doeldag)")
-        vb_view = fmt_df_m2(verplaatsblokken.copy(), ["m2"])
+        st.markdown("#### 1) Verplaatsblokken (oude plandatum leidend, daarna kleur en doeldag)")
+        vb_view = fmt_df_m2(verplaatsblokken_kleur.copy(), ["m2"])
         h1, h2, h3 = st.columns(3)
         h1.metric("Verplaatsblokken", len(vb_view))
         h2.metric("Te verplaatsen orders", int(vb_view["Orders"].sum()) if "Orders" in vb_view.columns else 0)
         h3.metric("Te verplaatsen m²", fmt_m2(vb_view["m2"].astype(str).str.replace(",", ".", regex=False).astype(float).sum()) if "m2" in vb_view.columns and len(vb_view) else "0,0")
         vb_cols = [
-            "Actieblok", "OudePlanDatum", "NieuwePlanDatum", "Verplaatsrichting", "Orders", "Kleuren", "m2", "OrderIDs"
+            "Actieblok", "OudePlanDatum", "Kleur", "NieuwePlanDatum", "Verplaatsrichting", "Orders", "m2", "Klanten", "OrderIDs"
         ]
-        if "Deelorders" in vb_view.columns:
-            vb_cols.append("Deelorders")
         vb_cols = [c for c in vb_cols if c in vb_view.columns]
         render_df(vb_view[vb_cols], height=320)
 
         st.markdown("#### 2) Order-actielijst (volgorde voor handmatige verwerking)")
-        hap_view = fmt_df_m2(herpland_actie.copy(), ["M2"])
-        st.caption("Aanpak: werk eerst per verplaatsblok en verwerk daarna de order-acties van boven naar beneden.")
+        hap_view = drop_deelorder_columns(fmt_df_m2(herpland_actie.copy(), ["M2"]))
+        st.caption("Aanpak: werk eerst per kleurblok en verwerk daarna de order-acties van boven naar beneden.")
         render_df(hap_view, height=520)
 
 with detail_tab:
     st.markdown("### Detailplanning (alles)")
-    detail = fmt_df_m2(df.copy(), ["M2"])
+    detail = drop_deelorder_columns(fmt_df_m2(df.copy(), ["M2"]))
     render_df(detail, height=560)
 
 with niet_planbaar_tab:
@@ -980,7 +1079,6 @@ with niet_planbaar_tab:
                     Kleuren=("Kleur", pd.Series.nunique),
                     m2=("M2", "sum"),
                     OrderIDs=("OrderID", lambda s: ", ".join(map(str, pd.Series(s).astype(str).tolist()))),
-                    Deelorders=("DeelorderID", lambda s: ", ".join(pd.Series(s).dropna().astype(str).tolist()) if "DeelorderID" in late_full.columns else ""),
                 )
                 .reset_index()
                 .sort_values([c for c in ["AdviesPlanDatum", "AdviesLeverDatum", "AdviesActie"] if c in grp_cols])
@@ -1020,14 +1118,8 @@ with niet_planbaar_tab:
             render_df(adviesblokken_view[ab_cols], height=340)
 
         with st.expander("Orderdetails tonen (alleen bij uitzondering)", expanded=False):
-            late_view = late_full.copy()
-            cols = [
-                "OrderID", "DeelorderID", "Kleur", "M2", "LeverDatum", "AdviesPlanDatum", "AdviesLeverDatum",
-                "WerkdagenTeLaat", "AdviesActie", "Reden", "AdviesToelichting"
-            ]
-            cols = [c for c in cols if c in late_view.columns]
-            late_view = late_view[cols]
-            late_view = fmt_df_m2(late_view, ["M2"]).sort_values([c for c in ["AdviesPlanDatum", "LeverDatum", "OrderID"] if c in late_view.columns])
+            late_view = drop_deelorder_columns(compact_late_columns(late_full.copy()))
+            late_view = fmt_df_m2(late_view, ["M2"]).sort_values([c for c in ["OudePlanDatum", "AdviesPlanDatum", "LeverDatum", "OrderID"] if c in late_view.columns])
             render_df(late_view, height=420)
 
 with instellingen_tab:
@@ -1047,6 +1139,7 @@ with instellingen_tab:
             ("Weekenden uitsluiten", "Ja" if exclude_weekends else "Nee"),
             ("Feestdagen/sluitingsdagen uitsluiten", "Ja" if exclude_holidays else "Nee"),
             ("Optimizer", optimizer),
+        ("App versie", APP_VERSION),
             ("Aantal ingestelde feestdagen/sluitingsdagen", len(holidays)),
             ("Persistente instellingenbestand", str(SETTINGS_FILE.name)),
         ],
@@ -1065,23 +1158,15 @@ with instellingen_tab:
 
 # ---------- Export ----------
 output = BytesIO()
-export_detail = normalize_dates(df.copy())
-export_herpland = normalize_dates(herpland_actie.copy())
-export_verplaatsblokken = normalize_dates(verplaatsblokken.copy())
+export_detail = drop_deelorder_columns(normalize_dates(df.copy()))
+export_herpland = drop_deelorder_columns(normalize_dates(herpland_actie.copy()))
+export_verplaatsblokken = drop_deelorder_columns(normalize_dates(verplaatsblokken.copy()))
+export_verplaatsblokken_kleur = drop_deelorder_columns(normalize_dates(verplaatsblokken_kleur.copy()))
 export_dag = normalize_dates(dagsamenvatting.copy())
-export_kleur = normalize_dates(kleurblokken.copy())
-export_late = normalize_dates(late.copy())
-if "AdviesToelichting" in export_late.columns:
-    cols = list(export_late.columns)
-    if "OrderTypeAfkorting" in cols:
-        insert_at = cols.index("OrderTypeAfkorting")
-        cols = [c for c in cols if c != "OrderTypeAfkorting"]
-        cols = [c for c in cols if c != "AdviesToelichting"]
-        cols.insert(insert_at, "AdviesToelichting")
-        export_late = export_late[cols]
-    else:
-        cols = [c for c in cols if c != "AdviesToelichting"] + ["AdviesToelichting"]
-        export_late = export_late[cols]
+export_kleur = drop_deelorder_columns(normalize_dates(kleurblokken.copy()))
+export_late = drop_deelorder_columns(compact_late_columns(normalize_dates(late.copy())))
+
+
 export_settings = pd.DataFrame(
     [
         ("Max m² per dag", max_m2),
@@ -1097,6 +1182,7 @@ export_settings = pd.DataFrame(
         ("Weekenden uitsluiten", "Ja" if exclude_weekends else "Nee"),
         ("Feestdagen/sluitingsdagen uitsluiten", "Ja" if exclude_holidays else "Nee"),
         ("Optimizer", optimizer),
+        ("App versie", APP_VERSION),
         ("Aantal ingestelde feestdagen/sluitingsdagen", len(holidays)),
         ("Persistente instellingenbestand", str(SETTINGS_FILE.name)),
         ("Feestdagen/sluitingsdagen (tekstveld)", st.session_state["holiday_text"]),
@@ -1108,6 +1194,7 @@ with pd.ExcelWriter(output, engine="openpyxl") as writer:
     export_detail.to_excel(writer, index=False, sheet_name="Resultaat")
     export_herpland.to_excel(writer, index=False, sheet_name="Te herplannen orders")
     export_verplaatsblokken.to_excel(writer, index=False, sheet_name="Verplaatsblokken")
+    export_verplaatsblokken_kleur.to_excel(writer, index=False, sheet_name="Verplaatsblokken kleur")
     export_dag.to_excel(writer, index=False, sheet_name="Dagoverzicht")
     export_kleur.to_excel(writer, index=False, sheet_name="Kleurblokken")
     export_late.to_excel(writer, index=False, sheet_name="Niet planbaar advies")
@@ -1130,7 +1217,7 @@ with pd.ExcelWriter(output, engine="openpyxl") as writer:
     m2_format = "0.0"
     pct_format = "0%"
     center_headers = {"Stoplicht_m2", "Stoplicht_kleuren", "Gefixeerd", "Gefixeerd_JaNee", "Regel_5WerkdagenVanToepassing"}
-    wide_caps = {"ReferentieKlant": 38, "Omschrijving": 38, "OrderIDs": 55, "Deelorders": 55, "Waarde": 80, "Actie": 28, "Actieblok": 36, "Reden": 34}
+    wide_caps = {"ReferentieKlant": 38, "Omschrijving": 38, "OrderIDs": 55, "Waarde": 80, "Actie": 28, "Actieblok": 42, "Reden": 34, "Klanten": 42, "AdviesToelichting": 55}
 
     for wsname in wb.sheetnames:
         ws = wb[wsname]
