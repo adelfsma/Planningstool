@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
@@ -15,7 +16,7 @@ try:
 except Exception:
     ORTOOLS_OK = False
 
-APP_VERSION = "19.4"
+APP_VERSION = "19.9"
 APP_TITLE = f"Coatinc De Meern - Planning Optimizer v{APP_VERSION}"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -156,13 +157,8 @@ pref_dagen_voor_lever = st.sidebar.number_input(
     min_value=1,
     help="Soft: optimizer probeert deze extra buffer zoveel mogelijk aan te houden.",
 )
-max_werkdagen_voor_lever = st.sidebar.number_input(
-    "Maximaal # werkdagen vóór leverdatum (tenzij Binnen = waar)",
-    value=5,
-    step=1,
-    min_value=1,
-    help="Nieuwe regel: orders met Binnen = onwaar mogen niet eerder starten dan dit aantal werkdagen vóór LeverDatum.",
-)
+AANLEVER_PLUS_DAGEN = 1
+st.sidebar.caption("Vroegste dag-regel: als Binnen = waar dan direct planbaar; anders vanaf AanleverDatum + 1 dag.")
 
 st.sidebar.subheader("Fixeren")
 fixeer_morgen = st.sidebar.checkbox(
@@ -349,6 +345,12 @@ def add_workdays(d: pd.Timestamp, n: int, holidays_set: set[pd.Timestamp]) -> pd
     return cur
 
 
+def add_calendar_days(d: pd.Timestamp, n: int) -> pd.Timestamp:
+    if pd.isna(d):
+        return pd.NaT
+    return pd.Timestamp(d).normalize() + timedelta(days=int(n))
+
+
 def make_working_days(start, end, excl_weekends, holidays_set, excl_holidays):
     days = pd.date_range(start=start, end=end, freq="D")
     out = []
@@ -485,23 +487,47 @@ df["VoorkeurLaatsteDag"] = df["LeverDatum"].dt.normalize() - pd.to_timedelta(int
 
 def earliest_day(row):
     e = start
-    if not bool(row["_BinnenBool"]):
-        venster_start = subtract_workdays(row["LeverDatum"], int(max_werkdagen_voor_lever), holidays)
-        if pd.notna(venster_start):
-            e = max(e, venster_start)
+    if bool(row.get("_BinnenBool", False)):
+        return e
+    aanlever = pd.to_datetime(row.get("AanleverDatum"), errors="coerce")
+    if pd.notna(aanlever):
+        e = max(e, add_calendar_days(aanlever, AANLEVER_PLUS_DAGEN))
     return e
+
+
+def feasible_days_for_row(row, days, ignore_latest=False):
+    earliest = row.get("VroegsteDag", pd.NaT)
+    latest = row.get("LaatsteToegestaneDag", pd.NaT)
+    if pd.isna(earliest):
+        earliest = start
+    if ignore_latest:
+        return [d for d in days if d >= earliest]
+    if pd.isna(latest):
+        return []
+    return [d for d in days if d >= earliest and d <= latest]
 
 
 df["VroegsteDag"] = df.apply(earliest_day, axis=1)
 original_plan = pd.to_datetime(df["PlanDatum"], errors="coerce").dt.normalize().copy()
 
-df["Regel_5WerkdagenVanToepassing"] = (~df["_BinnenBool"]).map(lambda x: "Ja" if bool(x) else "Nee")
+df["Regel_AanleverdatumVanToepassing"] = (~df["_BinnenBool"]).map(lambda x: "Ja" if bool(x) else "Nee")
 
 # ---------- Heuristic ----------
 def solve_heuristic(df_in: pd.DataFrame):
     dfh = df_in.copy()
     day_m2 = {d: float(fixed_m2.get(d, 0.0)) for d in candidate_days}
     day_colors = {d: set(fixed.loc[fixed["PlanDatumN"] == d, "Kleur"].astype(str).tolist()) for d in candidate_days}
+    fixed_candidate = fixed[fixed["PlanDatumN"].isin(candidate_days)].copy()
+    day_order_ids = {d: set(fixed_candidate.loc[fixed_candidate["PlanDatumN"] == d, "OrderID"].astype(str).tolist()) for d in candidate_days}
+    day_order_color = {
+        d: set(
+            zip(
+                fixed_candidate.loc[fixed_candidate["PlanDatumN"] == d, "OrderID"].astype(str),
+                fixed_candidate.loc[fixed_candidate["PlanDatumN"] == d, "Kleur"].astype(str),
+            )
+        )
+        for d in candidate_days
+    }
 
     new_dates = {}
     unplanned_reason = {}
@@ -517,7 +543,7 @@ def solve_heuristic(df_in: pd.DataFrame):
         earliest = row["VroegsteDag"]
         pref_latest = row["VoorkeurLaatsteDag"]
 
-        feas_days = [d for d in candidate_days if (pd.notna(latest) and pd.notna(earliest) and d >= earliest and d <= latest)]
+        feas_days = feasible_days_for_row(row, candidate_days, ignore_latest=False)
 
         if not feas_days:
             new_dates[idx] = pd.NaT
@@ -535,14 +561,18 @@ def solve_heuristic(df_in: pd.DataFrame):
                 continue
             colors = day_colors[d]
             kleur = str(row["Kleur"])
+            order_id = str(row.get("OrderID", ""))
+            order_color = (order_id, kleur)
             new_color = kleur not in colors
             if (len(colors) + (1 if new_color else 0)) > cap_k_d:
                 continue
 
             after_pref = 1 if pd.notna(pref_latest) and d > pref_latest else 0
             add_color = 1 if new_color else 0
+            new_order_color_day = 0 if order_color in day_order_color[d] else 1
+            new_order_day = 0 if order_id in day_order_ids[d] else 1
             remcap = cap_m2_d - (day_m2[d] + m2)
-            score = (after_pref, add_color, remcap)
+            score = (after_pref, add_color, new_order_color_day, new_order_day, remcap)
 
             if best is None or score < best[0]:
                 best = (score, d)
@@ -556,6 +586,10 @@ def solve_heuristic(df_in: pd.DataFrame):
         new_dates[idx] = d
         day_m2[d] += float(row["M2"])
         day_colors[d].add(str(row["Kleur"]))
+        order_id = str(row.get("OrderID", ""))
+        kleur = str(row["Kleur"])
+        day_order_ids[d].add(order_id)
+        day_order_color[d].add((order_id, kleur))
 
     return new_dates, unplanned_reason
 
@@ -586,7 +620,8 @@ def solve_cpsat(df_in: pd.DataFrame):
         unassigned[i] = model.NewBoolVar(f"unassigned_{i}")
         earliest = dfi.at[i, "VroegsteDag"]
         latest = dfi.at[i, "LaatsteToegestaneDag"]
-        feasible_ts = [t for t, d in enumerate(days) if pd.notna(earliest) and pd.notna(latest) and d >= earliest and d <= latest]
+        feasible_days = feasible_days_for_row(dfi.loc[i], days, ignore_latest=False)
+        feasible_ts = [t for t, d in enumerate(days) if d in feasible_days]
         feasible_days_per_order[i] = feasible_ts
         for t in feasible_ts:
             x[(i, t)] = model.NewBoolVar(f"x_{i}_{t}")
@@ -621,11 +656,55 @@ def solve_cpsat(df_in: pd.DataFrame):
         _, cap_k_t = get_day_caps(days[t])
         model.Add(sum(y[(k, t)] for k in range(K)) <= int(cap_k_t))
 
+    order_labels = sorted(set(dfi["OrderID"].astype(str).tolist()))
+    z_order = {}
+    for o in order_labels:
+        fixed_days_o = set()
+        fixed_rows = dfi[(dfi["Gefixeerd"]) & (dfi["OrderID"].astype(str) == o)]
+        for _, fr in fixed_rows.iterrows():
+            pdn = pd.to_datetime(fr["PlanDatum"], errors="coerce")
+            if pd.notna(pdn):
+                fixed_days_o.add(pdn.normalize())
+        safe_o = re.sub(r"[^A-Za-z0-9_]+", "_", o)[:40]
+        for t, d in enumerate(days):
+            z_order[(o, t)] = model.NewBoolVar(f"z_order_{safe_o}_{t}")
+            if d in fixed_days_o:
+                model.Add(z_order[(o, t)] == 1)
+    for i in var_idx:
+        o = str(dfi.at[i, "OrderID"])
+        for t in feasible_days_per_order[i]:
+            model.Add(z_order[(o, t)] >= x[(i, t)])
+
+    order_color_labels = sorted(set((str(r["OrderID"]), str(r["Kleur"])) for _, r in dfi.iterrows()))
+    z_order_color = {}
+    for o, c in order_color_labels:
+        fixed_days_oc = set()
+        fixed_rows = dfi[(dfi["Gefixeerd"]) & (dfi["OrderID"].astype(str) == o) & (dfi["Kleur"].astype(str) == c)]
+        for _, fr in fixed_rows.iterrows():
+            pdn = pd.to_datetime(fr["PlanDatum"], errors="coerce")
+            if pd.notna(pdn):
+                fixed_days_oc.add(pdn.normalize())
+        safe_o = re.sub(r"[^A-Za-z0-9_]+", "_", o)[:30]
+        safe_c = re.sub(r"[^A-Za-z0-9_]+", "_", c)[:30]
+        for t, d in enumerate(days):
+            z_order_color[((o, c), t)] = model.NewBoolVar(f"z_oc_{safe_o}_{safe_c}_{t}")
+            if d in fixed_days_oc:
+                model.Add(z_order_color[((o, c), t)] == 1)
+    for i in var_idx:
+        o = str(dfi.at[i, "OrderID"])
+        c = str(dfi.at[i, "Kleur"])
+        for t in feasible_days_per_order[i]:
+            model.Add(z_order_color[((o, c), t)] >= x[(i, t)])
+
     BIG = 1_000_000
     W_COLOR = 1000
+    W_ORDER_COLOR_DAY = 20
+    W_ORDER_DAY = 8
     W_PREF = 1
     obj_terms = [BIG * unassigned[i] for i in var_idx]
     obj_terms += [W_COLOR * y[(k, t)] for k in range(K) for t in range(T)]
+    obj_terms += [W_ORDER_COLOR_DAY * z_order_color[(oc, t)] for oc in order_color_labels for t in range(T)]
+    obj_terms += [W_ORDER_DAY * z_order[(o, t)] for o in order_labels for t in range(T)]
 
     for i in var_idx:
         pref_latest = dfi.at[i, "VoorkeurLaatsteDag"]
@@ -710,7 +789,7 @@ LATE_REMOVE_COLS = [
     "Uren_Def", "Trav_Def", "Poed_Def", "Omzet_Def", "Kleurbitmap", "Gereed", "Colli",
     "Vak", "Lgn", "Grond", "Stralen", "StralenGereed", "Poetsen", "PoetsenGereed",
     "LeverDatumTypeAfkorting", "VoorkeurLaatsteDag", "VroegsteDag",
-    "Regel_5WerkdagenVanToepassing", "HardDeadlineOK", "OrderTypeAfkorting"
+    "Regel_AanleverdatumVanToepassing", "HardDeadlineOK", "OrderTypeAfkorting"
 ]
 
 def compact_late_columns(df_in: pd.DataFrame) -> pd.DataFrame:
@@ -757,10 +836,10 @@ def build_late_advice(df_all: pd.DataFrame, late_df: pd.DataFrame) -> pd.DataFra
         kleur = str(row.get("Kleur", ""))
         m2 = float(row.get("M2", 0.0) or 0.0)
 
+        advice_feasible_days = feasible_days_for_row(row, advice_days, ignore_latest=True)
+
         found = pd.NaT
-        for d in advice_days:
-            if d < earliest:
-                continue
+        for d in advice_feasible_days:
             cap_m2_d, cap_k_d = get_day_caps(pd.Timestamp(d))
             used_m2 = float(occ_m2.get(d, 0.0))
             used_colors = set(occ_colors.get(d, set()))
@@ -927,7 +1006,7 @@ if len(herpland):
             Klanten=("ReferentieKlant", lambda s: ", ".join(pd.Series(s).dropna().astype(str).unique().tolist()[:6])) if "ReferentieKlant" in herpland.columns else ("OrderID", lambda s: ""),
         )
         .reset_index()
-        .sort_values(["OudePlanDatum", "Kleur", "NieuwePlanDatum"], na_position="last")
+        .sort_values(["Kleur", "OudePlanDatum", "NieuwePlanDatum", "Verplaatsrichting"], ascending=[True, True, True, True], na_position="last", kind="mergesort")
     )
     verplaatsblokken_kleur["Actieblok"] = (
         "Kleur " + verplaatsblokken_kleur["Kleur"].astype(str)
@@ -939,7 +1018,7 @@ if len(herpland):
 actie_cols = [
     "Actie", "Verplaatsgroep", "OudePlanDatum", "NieuwePlanDatum", "Verschil_dagen", "Verplaatsrichting",
     "Naam", "OrderID", "VolgNr", "Kleur", "M2", "LeverDatum", "LaatsteToegestaneDag",
-    "VroegsteDag", "Binnen", "Regel_5WerkdagenVanToepassing", "ReferentieKlant", "Omschrijving"
+    "VroegsteDag", "Binnen", "Regel_AanleverdatumVanToepassing", "ReferentieKlant", "Omschrijving"
 ]
 herpland_actie = herpland.copy()
 actie_cols = [c for c in actie_cols if c in herpland_actie.columns]
@@ -968,10 +1047,10 @@ with st.expander("Toelichting planningsregels"):
     st.write(f"- **Hard deadline**: plandatum ≤ LeverDatum - {int(min_dagen_voor_lever)} dag(en)")
     st.write(f"- **Voorkeur buffer**: optimizer probeert plandatum ≤ LeverDatum - {int(pref_dagen_voor_lever)} dag(en)")
     st.write(
-        f"- **Nieuwe regel**: als **Binnen = onwaar**, dan mag een order niet eerder starten dan **{int(max_werkdagen_voor_lever)} werkdagen vóór leverdatum**."
+        "- **Nieuwe regel**: als **Binnen = waar**, dan is een order direct planbaar. Als **Binnen = onwaar**, dan is de vroegste plandatum **AanleverDatum + 1 dag**."
     )
-    st.write("- **Binnen = waar**: order mag eerder gestart worden dan deze 5-werkdagenregel.")
-    st.write("- **AanleverDatum wordt niet meer gebruikt** in de planning.")
+    st.write("- **Binnen = waar**: order is direct planbaar vanaf de start van de planningshorizon.")
+    st.write("- **AanleverDatum** wordt gebruikt voor de vroegste plandatum als **Binnen = onwaar**: **AanleverDatum + 1 dag**.")
 
 resultaat_tab, verplaatskleur_tab, herplan_tab, detail_tab, niet_planbaar_tab, instellingen_tab = st.tabs(
     ["Resultaat", "Verplaatsblokken op kleur", "Te herplannen orders", "Detailplanning", "Niet planbaar + advies", "Instellingen"]
@@ -1006,7 +1085,7 @@ with resultaat_tab:
 
 with verplaatskleur_tab:
     st.markdown("### Verplaatsblokken op kleur")
-    st.caption("Sortering: eerst oude plandatum, daarbinnen op kleur en daarna op nieuwe plandatum. Zo blijft de dagvolgorde leidend voor de planner.")
+    st.caption("Sortering: eerst kleur en daarbinnen op oude plandatum en daarna op nieuwe plandatum. Zo kan de planner eerst per kleur werken.")
     if len(herpland) == 0:
         st.success("Geen orders herpland.")
     else:
@@ -1015,7 +1094,7 @@ with verplaatskleur_tab:
         k1.metric("Kleurblokken", len(vbk_view))
         k2.metric("Te verplaatsen orders", int(vbk_view["Orders"].sum()) if "Orders" in vbk_view.columns else 0)
         k3.metric("Te verplaatsen m²", fmt_m2(float(vbk_view["m2"].astype(str).str.replace(",", ".", regex=False).astype(float).sum())) if "m2" in vbk_view.columns and len(vbk_view) else "0,0")
-        vbk_cols = ["Actieblok", "OudePlanDatum", "Kleur", "NieuwePlanDatum", "Verplaatsrichting", "Orders", "m2", "Klanten", "OrderIDs"]
+        vbk_cols = ["Kleur", "OudePlanDatum", "NieuwePlanDatum", "Verplaatsrichting", "Actieblok", "Orders", "m2", "Klanten", "OrderIDs"]
         vbk_cols = [c for c in vbk_cols if c in vbk_view.columns]
         render_df(vbk_view[vbk_cols], height=420)
 
@@ -1133,7 +1212,7 @@ with instellingen_tab:
             ("Max kleuren op vrijdag", friday_max_kleuren),
             ("Hard buffer vóór leverdatum", min_dagen_voor_lever),
             ("Voorkeur buffer vóór leverdatum", pref_dagen_voor_lever),
-            ("Max werkdagen vóór leverdatum (indien Binnen = onwaar)", max_werkdagen_voor_lever),
+            ("Vroegste dag-regel (indien Binnen = onwaar)", "AanleverDatum + 1 dag"),
             ("Fixeer volgende werkdag", "Ja" if fixeer_morgen else "Nee"),
             ("Fixeer 2e volgende werkdag", "Ja" if fixeer_overmorgen else "Nee"),
             ("Weekenden uitsluiten", "Ja" if exclude_weekends else "Nee"),
@@ -1176,7 +1255,7 @@ export_settings = pd.DataFrame(
         ("Max kleuren op vrijdag", friday_max_kleuren),
         ("Hard buffer vóór leverdatum", min_dagen_voor_lever),
         ("Voorkeur buffer vóór leverdatum", pref_dagen_voor_lever),
-        ("Max werkdagen vóór leverdatum (indien Binnen = onwaar)", max_werkdagen_voor_lever),
+        ("Vroegste dag-regel (indien Binnen = onwaar)", "AanleverDatum + 1 dag"),
         ("Fixeer volgende werkdag", "Ja" if fixeer_morgen else "Nee"),
         ("Fixeer 2e volgende werkdag", "Ja" if fixeer_overmorgen else "Nee"),
         ("Weekenden uitsluiten", "Ja" if exclude_weekends else "Nee"),
@@ -1216,7 +1295,7 @@ with pd.ExcelWriter(output, engine="openpyxl") as writer:
     date_format = "DD-MM-YYYY"
     m2_format = "0.0"
     pct_format = "0%"
-    center_headers = {"Stoplicht_m2", "Stoplicht_kleuren", "Gefixeerd", "Gefixeerd_JaNee", "Regel_5WerkdagenVanToepassing"}
+    center_headers = {"Stoplicht_m2", "Stoplicht_kleuren", "Gefixeerd", "Gefixeerd_JaNee", "Regel_AanleverdatumVanToepassing"}
     wide_caps = {"ReferentieKlant": 38, "Omschrijving": 38, "OrderIDs": 55, "Waarde": 80, "Actie": 28, "Actieblok": 42, "Reden": 34, "Klanten": 42, "AdviesToelichting": 55}
 
     for wsname in wb.sheetnames:
