@@ -16,7 +16,7 @@ try:
 except Exception:
     ORTOOLS_OK = False
 
-APP_VERSION = "19.16"
+APP_VERSION = "19.20"
 APP_TITLE = f"Coatinc De Meern - Planning Optimizer v{APP_VERSION}"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -374,6 +374,7 @@ def compact_detailplanning_columns(df_in: pd.DataFrame) -> pd.DataFrame:
         ("OudePlanDatum", "oudePlanDatum"),
         ("NieuwePlanDatum", "NieuwePlanDatum"),
         ("Binnen", "Binnen"),
+        ("ReferentieKlant", "ReferentieKlant"),
         ("LaatsteToegestaneDag", "Laatste toegestane dag"),
         ("VroegsteDag", "vroegste dag"),
         ("Gewijzigd", "gewijzigd"),
@@ -1194,7 +1195,7 @@ with herplan_tab:
         h2.metric("Te verplaatsen orders", int(vb_view["Orders"].sum()) if "Orders" in vb_view.columns else 0)
         h3.metric("Te verplaatsen m²", fmt_m2(vb_view["m2"].astype(str).str.replace(",", ".", regex=False).astype(float).sum()) if "m2" in vb_view.columns and len(vb_view) else "0,0")
         vb_cols = [
-            "Actieblok", "OudePlanDatum", "Kleur", "NieuwePlanDatum", "Verplaatsrichting", "Orders", "m2", "Klanten", "OrderIDs"
+            "Kleur", "OudePlanDatum", "NieuwePlanDatum", "OrderIDs", "Verplaatsrichting", "Actieblok", "Orders", "m2", "ReferentieKlant"
         ]
         vb_cols = [c for c in vb_cols if c in vb_view.columns]
         render_df(vb_view[vb_cols], height=320)
