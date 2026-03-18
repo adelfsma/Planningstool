@@ -16,7 +16,7 @@ try:
 except Exception:
     ORTOOLS_OK = False
 
-APP_VERSION = "19.9"
+APP_VERSION = "19.16"
 APP_TITLE = f"Coatinc De Meern - Planning Optimizer v{APP_VERSION}"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -31,7 +31,16 @@ st.markdown(
     """<style>
     div[data-testid='stDataFrame'] div[role='gridcell']{
         white-space: normal !important;
-        line-height: 1.2em;
+        line-height: 1.15em;
+        padding: 0.18rem 0.28rem !important;
+        font-size: 0.84rem !important;
+    }
+    div[data-testid='stDataFrame'] [data-testid='stHeaderCell'] {
+        padding: 0.2rem 0.3rem !important;
+        font-size: 0.82rem !important;
+    }
+    div[data-testid='stDataFrame'] {
+        max-width: fit-content;
     }
     div[data-testid="stMetric"] {
         background: #f6f8fb;
@@ -285,18 +294,37 @@ def format_dates_ddmmyyyy(df_in: pd.DataFrame) -> pd.DataFrame:
 
 def make_column_config(df: pd.DataFrame):
     cfg = {}
+    medium_cols = {
+        "kleur",
+        "stoplicht m2",
+        "stoplicht kleuren",
+        "belasting m2 pct",
+        "belasting kleur pct",
+        "referentieklant",
+        "orderids",
+        "actieblok",
+        "adviestoelichting",
+    }
+    large_cols = {"referentieklant"}
+    date_cols = {
+        "oudeplandatum",
+        "nieuweplandatum",
+        "leverdatum",
+        "aanleverdatum",
+        "vroegste dag",
+        "laatste toegestane dag",
+        "vroegstedag",
+        "laatstetoegestanedag",
+        "dag",
+    }
     for col in df.columns:
         low = str(col).lower()
-        if low in ["omschrijving", "referentieklant", "orderids", "deelorders", "actieblok", "actie", "reden"]:
+        if low in large_cols:
             cfg[col] = st.column_config.TextColumn(col, width="large")
-        elif low in ["naam", "verplaatsgroep"]:
-            cfg[col] = st.column_config.TextColumn(col, width="medium")
-        elif low in ["kleur", "orderid", "deelorderid", "volgnr", "prio", "ordertypeafkorting", "verplaatsrichting", "stoplicht_m2", "stoplicht_kleuren"]:
-            cfg[col] = st.column_config.TextColumn(col, width="small")
-        elif ("datum" in low) or low.endswith("dag"):
+        elif low in medium_cols or low in date_cols:
             cfg[col] = st.column_config.TextColumn(col, width="medium")
         else:
-            cfg[col] = st.column_config.TextColumn(col, width="large")
+            cfg[col] = st.column_config.TextColumn(col, width="small")
     return cfg
 
 
@@ -305,11 +333,56 @@ def render_df(df_in: pd.DataFrame, *, height: int | str = "content"):
         height = "content"
     st.dataframe(
         format_dates_ddmmyyyy(df_in),
-        use_container_width=True,
+        use_container_width=False,
         hide_index=True,
         height=height,
         column_config=make_column_config(df_in),
     )
+
+
+def compact_dagoverzicht_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+    df_out = df_in.copy()
+    keep_map = [
+        ("Dag", "Dag"),
+        ("Orders", "aantal orders"),
+        ("m2", "m2"),
+        ("Kleuren", "kleuren"),
+        ("Stoplicht_m2", "Stoplicht m2"),
+        ("Stoplicht_kleuren", "stoplicht kleuren"),
+        ("Belasting_m2_pct", "Belasting m2 pct"),
+        ("Belasting_kleur_pct", "belasting kleur pct"),
+    ]
+    cols = []
+    for src, dst in keep_map:
+        if src in df_out.columns:
+            cols.append(src)
+    df_out = df_out[cols]
+    rename_map = {src: dst for src, dst in keep_map if src in df_out.columns}
+    return df_out.rename(columns=rename_map)
+
+
+def compact_detailplanning_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+    df_out = df_in.copy()
+    keep_map = [
+        ("Naam", "Naam"),
+        ("OrderID", "OrderID"),
+        ("VolgNr", "Volgnummer"),
+        ("Kleur", "Kleur"),
+        ("M2", "M2"),
+        ("LeverDatum", "Leverdatum"),
+        ("AanleverDatum", "Aanleverdatum"),
+        ("OudePlanDatum", "oudePlanDatum"),
+        ("NieuwePlanDatum", "NieuwePlanDatum"),
+        ("Binnen", "Binnen"),
+        ("LaatsteToegestaneDag", "Laatste toegestane dag"),
+        ("VroegsteDag", "vroegste dag"),
+        ("Gewijzigd", "gewijzigd"),
+        ("Gefixeerd", "gefixeerd"),
+    ]
+    cols = [src for src, _ in keep_map if src in df_out.columns]
+    df_out = df_out[cols]
+    rename_map = {src: dst for src, dst in keep_map if src in df_out.columns}
+    return df_out.rename(columns=rename_map)
 
 
 def is_weekend(d: pd.Timestamp) -> bool:
@@ -1003,7 +1076,7 @@ if len(herpland):
             Orders=("OrderID", "count"),
             m2=("M2", "sum"),
             OrderIDs=("OrderID", lambda s: ", ".join(map(str, pd.Series(s).astype(str).tolist()))),
-            Klanten=("ReferentieKlant", lambda s: ", ".join(pd.Series(s).dropna().astype(str).unique().tolist()[:6])) if "ReferentieKlant" in herpland.columns else ("OrderID", lambda s: ""),
+            ReferentieKlant=("ReferentieKlant", lambda s: ", ".join(pd.Series(s).dropna().astype(str).unique().tolist()[:6])) if "ReferentieKlant" in herpland.columns else ("OrderID", lambda s: ""),
         )
         .reset_index()
         .sort_values(["Kleur", "OudePlanDatum", "NieuwePlanDatum", "Verplaatsrichting"], ascending=[True, True, True, True], na_position="last", kind="mergesort")
@@ -1058,16 +1131,11 @@ resultaat_tab, verplaatskleur_tab, herplan_tab, detail_tab, niet_planbaar_tab, i
 
 with resultaat_tab:
     st.markdown("### Dagoverzicht")
-    dagsamenvatting_view = fmt_df_m2(dagsamenvatting.copy(), ["m2", "m2_gefixeerd", "m2_nieuw", "Cap_m2"])
+    dagsamenvatting_view = fmt_df_m2(dagsamenvatting.copy(), ["m2"])
     dagsamenvatting_view["Belasting_m2_pct"] = dagsamenvatting["Belasting_m2_pct"].apply(format_pct)
     dagsamenvatting_view["Belasting_kleur_pct"] = dagsamenvatting["Belasting_kleur_pct"].apply(format_pct)
-    show_cols = [
-        "Dag", "Orders", "m2", "Cap_m2", "Stoplicht_m2", "Belasting_m2_pct",
-        "Kleuren", "Cap_kleuren", "Stoplicht_kleuren", "Belasting_kleur_pct",
-        "m2_gefixeerd", "m2_nieuw", "orders_gefixeerd", "orders_nieuw"
-    ]
-    show_cols = [c for c in show_cols if c in dagsamenvatting_view.columns]
-    render_df(dagsamenvatting_view[show_cols], height=420)
+    dagsamenvatting_view = compact_dagoverzicht_columns(dagsamenvatting_view)
+    render_df(dagsamenvatting_view, height=420)
 
     st.markdown("### Kleurblokken per dag")
     kleurblokken_view = drop_deelorder_columns(fmt_df_m2(kleurblokken.copy(), ["m2"]))
@@ -1094,7 +1162,7 @@ with verplaatskleur_tab:
         k1.metric("Kleurblokken", len(vbk_view))
         k2.metric("Te verplaatsen orders", int(vbk_view["Orders"].sum()) if "Orders" in vbk_view.columns else 0)
         k3.metric("Te verplaatsen m²", fmt_m2(float(vbk_view["m2"].astype(str).str.replace(",", ".", regex=False).astype(float).sum())) if "m2" in vbk_view.columns and len(vbk_view) else "0,0")
-        vbk_cols = ["Kleur", "OudePlanDatum", "NieuwePlanDatum", "Verplaatsrichting", "Actieblok", "Orders", "m2", "Klanten", "OrderIDs"]
+        vbk_cols = ["Kleur", "OudePlanDatum", "NieuwePlanDatum", "OrderIDs", "Verplaatsrichting", "Actieblok", "Orders", "m2", "ReferentieKlant"]
         vbk_cols = [c for c in vbk_cols if c in vbk_view.columns]
         render_df(vbk_view[vbk_cols], height=420)
 
@@ -1138,7 +1206,7 @@ with herplan_tab:
 
 with detail_tab:
     st.markdown("### Detailplanning (alles)")
-    detail = drop_deelorder_columns(fmt_df_m2(df.copy(), ["M2"]))
+    detail = compact_detailplanning_columns(drop_deelorder_columns(fmt_df_m2(df.copy(), ["M2"])))
     render_df(detail, height=560)
 
 with niet_planbaar_tab:
@@ -1237,11 +1305,14 @@ with instellingen_tab:
 
 # ---------- Export ----------
 output = BytesIO()
-export_detail = drop_deelorder_columns(normalize_dates(df.copy()))
+export_detail = compact_detailplanning_columns(drop_deelorder_columns(normalize_dates(df.copy())))
 export_herpland = drop_deelorder_columns(normalize_dates(herpland_actie.copy()))
 export_verplaatsblokken = drop_deelorder_columns(normalize_dates(verplaatsblokken.copy()))
-export_verplaatsblokken_kleur = drop_deelorder_columns(normalize_dates(verplaatsblokken_kleur.copy()))
-export_dag = normalize_dates(dagsamenvatting.copy())
+export_verplaatsblokken_kleur = normalize_dates(verplaatsblokken_kleur.copy())
+evbk_cols = ["Kleur", "OudePlanDatum", "NieuwePlanDatum", "OrderIDs", "Verplaatsrichting", "Actieblok", "Orders", "m2", "ReferentieKlant"]
+evbk_cols = [c for c in evbk_cols if c in export_verplaatsblokken_kleur.columns]
+export_verplaatsblokken_kleur = export_verplaatsblokken_kleur[evbk_cols]
+export_dag = compact_dagoverzicht_columns(normalize_dates(dagsamenvatting.copy()))
 export_kleur = drop_deelorder_columns(normalize_dates(kleurblokken.copy()))
 export_late = drop_deelorder_columns(compact_late_columns(normalize_dates(late.copy())))
 
@@ -1296,7 +1367,7 @@ with pd.ExcelWriter(output, engine="openpyxl") as writer:
     m2_format = "0.0"
     pct_format = "0%"
     center_headers = {"Stoplicht_m2", "Stoplicht_kleuren", "Gefixeerd", "Gefixeerd_JaNee", "Regel_AanleverdatumVanToepassing"}
-    wide_caps = {"ReferentieKlant": 38, "Omschrijving": 38, "OrderIDs": 55, "Waarde": 80, "Actie": 28, "Actieblok": 42, "Reden": 34, "Klanten": 42, "AdviesToelichting": 55}
+    wide_caps = {"ReferentieKlant": 24, "Omschrijving": 24, "OrderIDs": 34, "Waarde": 60, "Actie": 22, "Actieblok": 28, "Reden": 22, "Klanten": 24, "AdviesToelichting": 34}
 
     for wsname in wb.sheetnames:
         ws = wb[wsname]
