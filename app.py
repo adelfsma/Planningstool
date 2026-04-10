@@ -9,6 +9,63 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
+def build_kleurpivot(df, datumkolom):
+    dfp = df.copy()
+
+    if datumkolom not in dfp.columns:
+        return pd.DataFrame()
+
+    dfp["Datum"] = pd.to_datetime(dfp[datumkolom], errors="coerce").dt.date
+
+    pivot = pd.pivot_table(
+        dfp,
+        index="Kleur",
+        columns="Datum",
+        values="M2",
+        aggfunc="sum",
+        fill_value=0
+    )
+
+    if pivot.empty:
+        return pivot
+
+    pivot["Eindtotaal"] = pivot.sum(axis=1)
+
+    m2_per_dag = pivot.sum(axis=0)
+    kleurwissels = (pivot > 0).sum(axis=0)
+
+    header_df = pd.DataFrame(
+        [m2_per_dag, kleurwissels],
+        index=["m2", "Kleurwissels"]
+    )
+
+    return pd.concat([header_df, pivot])
+
+
+def bereken_kpi(df, datumkolom, threshold=10):
+    dfp = df.copy()
+    dfp["Datum"] = pd.to_datetime(dfp[datumkolom], errors="coerce")
+
+    totaal_m2 = dfp["M2"].sum()
+
+    kleur_per_dag = dfp.groupby("Datum")["Kleur"].nunique()
+    kleurwissels = kleur_per_dag.sum()
+
+    avg_m2_per_kleur = totaal_m2 / max(kleurwissels, 1)
+
+    kleine_blokken = dfp[dfp["M2"] < threshold].shape[0]
+
+    fragmentatie = dfp.groupby("Kleur")["Datum"].nunique().mean()
+
+    return {
+        "kleurwissels": int(kleurwissels),
+        "avg_m2_per_kleur": round(avg_m2_per_kleur, 1),
+        "kleine_blokken": int(kleine_blokken),
+        "fragmentatie": round(fragmentatie, 2)
+    }
+
+
+
 # Optional CP-SAT (ortools)
 try:
     from ortools.sat.python import cp_model
@@ -16,7 +73,7 @@ try:
 except Exception:
     ORTOOLS_OK = False
 
-APP_VERSION = "19.20"
+APP_VERSION = "20.3"
 APP_TITLE = f"Coatinc De Meern - Planning Optimizer v{APP_VERSION}"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -159,13 +216,6 @@ min_dagen_voor_lever = st.sidebar.number_input(
     min_value=1,
     help="Hard: productie moet uiterlijk LeverDatum - dit aantal dagen gepland staan.",
 )
-pref_dagen_voor_lever = st.sidebar.number_input(
-    "Voorkeur # dagen vóór leverdatum (soft)",
-    value=2,
-    step=1,
-    min_value=1,
-    help="Soft: optimizer probeert deze extra buffer zoveel mogelijk aan te houden.",
-)
 AANLEVER_PLUS_DAGEN = 1
 st.sidebar.caption("Vroegste dag-regel: als Binnen = waar dan direct planbaar; anders vanaf AanleverDatum + 1 dag.")
 
@@ -179,6 +229,25 @@ fixeer_overmorgen = st.sidebar.checkbox(
     "Fixeer ook 2e volgende werkdag",
     value=False,
     help="Zet ook de 2e volgende planbare werkdag op slot (geen herplanning / geen nieuwe orders op die dag).",
+)
+
+st.sidebar.subheader("Kleurblok-prioriteit")
+gebruik_kleurblok_prioriteit = st.sidebar.checkbox(
+    "Geef voorrang aan grote kleurblokken",
+    value=True,
+    help="Kleine dag-kleurblokken krijgen lagere prioriteit, zodat deze eerder niet planbaar worden en als uitbesteed kandidaat zichtbaar worden.",
+)
+kleurblok_drempel_m2 = st.sidebar.number_input(
+    "Drempel klein kleurblok (m²)",
+    min_value=0.0,
+    value=10.0,
+    step=1.0,
+    help="Dag-kleurblokken onder deze grens worden als klein beschouwd.",
+)
+harde_uitsluiting_kleine_blokken = st.sidebar.checkbox(
+    "Kleine kleurblokken hard uitsluiten",
+    value=False,
+    help="Testoptie: kleine dag-kleurblokken worden direct niet planbaar gemaakt. Standaard uit laten en zachte prioritering gebruiken.",
 )
 
 st.sidebar.subheader("Kalender")
@@ -375,6 +444,8 @@ def compact_detailplanning_columns(df_in: pd.DataFrame) -> pd.DataFrame:
         ("NieuwePlanDatum", "NieuwePlanDatum"),
         ("Binnen", "Binnen"),
         ("ReferentieKlant", "ReferentieKlant"),
+        ("DagKleurblokM2", "DagKleurblokM2"),
+        ("UitbesteedKandidaat", "UitbesteedKandidaat"),
         ("LaatsteToegestaneDag", "Laatste toegestane dag"),
         ("VroegsteDag", "vroegste dag"),
         ("Gewijzigd", "gewijzigd"),
@@ -514,6 +585,10 @@ volgende_werkdag = volgende_werkdagen[0] if len(volgende_werkdagen) >= 1 else va
 tweede_volgende_werkdag = volgende_werkdagen[1] if len(volgende_werkdagen) >= 2 else volgende_werkdag + timedelta(days=1)
 
 # Fix rules
+# Gewenste werking:
+# - orders met oude plandatum vandaag of eerder blijven altijd ongewijzigd
+# - nieuwe orders mogen nooit naar vandaag of eerder gepland worden
+# - volgende / 2e volgende werkdag blijven alleen planbaar als het bijbehorende fixeer-vinkje uit staat
 plan_norm = pd.to_datetime(df["PlanDatum"], errors="coerce").dt.normalize()
 df["Gefixeerd"] = plan_norm.le(vandaag).fillna(False)
 if fixeer_morgen:
@@ -521,7 +596,14 @@ if fixeer_morgen:
 if fixeer_overmorgen:
     df.loc[plan_norm == tweede_volgende_werkdag, "Gefixeerd"] = True
 
-locked_days = set(pd.to_datetime(df.loc[df["Gefixeerd"], "PlanDatum"], errors="coerce").dt.normalize().dropna().unique())
+fixed_order_days = set(pd.to_datetime(df.loc[df["Gefixeerd"], "PlanDatum"], errors="coerce").dt.normalize().dropna().unique())
+explicit_blocked_days = set()
+if fixeer_morgen:
+    explicit_blocked_days.add(volgende_werkdag)
+if fixeer_overmorgen:
+    explicit_blocked_days.add(tweede_volgende_werkdag)
+
+locked_days = fixed_order_days | explicit_blocked_days
 
 max_lever = df["LeverDatum"].max()
 if pd.isna(max_lever):
@@ -556,7 +638,6 @@ for d in sorted(locked_days):
 # Compute deadlines
 
 df["LaatsteToegestaneDag"] = df["LeverDatum"].dt.normalize() - pd.to_timedelta(int(min_dagen_voor_lever), unit="D")
-df["VoorkeurLaatsteDag"] = df["LeverDatum"].dt.normalize() - pd.to_timedelta(int(pref_dagen_voor_lever), unit="D")
 
 
 def earliest_day(row):
@@ -584,6 +665,21 @@ def feasible_days_for_row(row, days, ignore_latest=False):
 df["VroegsteDag"] = df.apply(earliest_day, axis=1)
 original_plan = pd.to_datetime(df["PlanDatum"], errors="coerce").dt.normalize().copy()
 
+# ---------- Kleurblok-prioriteit ----------
+df["PlanDatumN"] = pd.to_datetime(df["PlanDatum"], errors="coerce").dt.normalize()
+
+kleurblok_basis = (
+    df.groupby(["PlanDatumN", "Kleur"], dropna=False)["M2"]
+    .sum()
+    .reset_index()
+    .rename(columns={"M2": "DagKleurblokM2"})
+)
+
+df = df.merge(kleurblok_basis, on=["PlanDatumN", "Kleur"], how="left")
+df["DagKleurblokM2"] = df["DagKleurblokM2"].fillna(df["M2"])
+df["KleinKleurblok"] = df["DagKleurblokM2"] < float(kleurblok_drempel_m2)
+df["UitbesteedKandidaat"] = df["KleinKleurblok"].map(lambda x: "Ja" if bool(x) else "Nee")
+
 df["Regel_AanleverdatumVanToepassing"] = (~df["_BinnenBool"]).map(lambda x: "Ja" if bool(x) else "Nee")
 
 # ---------- Heuristic ----------
@@ -606,7 +702,17 @@ def solve_heuristic(df_in: pd.DataFrame):
     new_dates = {}
     unplanned_reason = {}
 
-    dfh2 = dfh.sort_values(["LaatsteToegestaneDag", "LeverDatum", "M2"], ascending=[True, True, False])
+    sort_cols = ["LaatsteToegestaneDag", "LeverDatum"]
+    ascending = [True, True]
+    if gebruik_kleurblok_prioriteit:
+        dfh["KleurblokPrioriteit"] = dfh["DagKleurblokM2"].fillna(0)
+        dfh["KleinKleurblokSort"] = dfh["KleinKleurblok"].map(lambda x: 1 if bool(x) else 0)
+        sort_cols += ["KleinKleurblokSort", "KleurblokPrioriteit", "M2"]
+        ascending += [True, False, False]
+    else:
+        sort_cols += ["M2"]
+        ascending += [False]
+    dfh2 = dfh.sort_values(sort_cols, ascending=ascending)
 
     for idx, row in dfh2.iterrows():
         if row["Gefixeerd"] or pd.isna(row["PlanDatum"]):
@@ -615,16 +721,21 @@ def solve_heuristic(df_in: pd.DataFrame):
 
         latest = row["LaatsteToegestaneDag"]
         earliest = row["VroegsteDag"]
-        pref_latest = row["VoorkeurLaatsteDag"]
-
         feas_days = feasible_days_for_row(row, candidate_days, ignore_latest=False)
 
         if not feas_days:
             new_dates[idx] = pd.NaT
             if pd.notna(earliest) and pd.notna(latest) and earliest > latest:
                 unplanned_reason[idx] = "Venster ongeldig: vroegste dag ligt na hard deadline"
+            elif bool(row.get("KleinKleurblok", False)) and gebruik_kleurblok_prioriteit:
+                unplanned_reason[idx] = f"Uitbesteed kandidaat: klein dag-kleurblok (< {kleurblok_drempel_m2:.1f} m²)"
             else:
                 unplanned_reason[idx] = "Niet planbaar binnen kalender/deadline"
+            continue
+
+        if gebruik_kleurblok_prioriteit and harde_uitsluiting_kleine_blokken and bool(row.get("KleinKleurblok", False)):
+            new_dates[idx] = pd.NaT
+            unplanned_reason[idx] = f"Uitbesteed kandidaat: dag-kleurblok < {kleurblok_drempel_m2:.1f} m²"
             continue
 
         best = None
@@ -641,19 +752,22 @@ def solve_heuristic(df_in: pd.DataFrame):
             if (len(colors) + (1 if new_color else 0)) > cap_k_d:
                 continue
 
-            after_pref = 1 if pd.notna(pref_latest) and d > pref_latest else 0
+            klein_blok = 1 if bool(row.get("KleinKleurblok", False)) and gebruik_kleurblok_prioriteit else 0
             add_color = 1 if new_color else 0
             new_order_color_day = 0 if order_color in day_order_color[d] else 1
             new_order_day = 0 if order_id in day_order_ids[d] else 1
             remcap = cap_m2_d - (day_m2[d] + m2)
-            score = (after_pref, add_color, new_order_color_day, new_order_day, remcap)
+            score = (klein_blok, add_color, new_order_color_day, new_order_day, remcap)
 
             if best is None or score < best[0]:
                 best = (score, d)
 
         if best is None:
             new_dates[idx] = pd.NaT
-            unplanned_reason[idx] = "Capaciteit/kleur-limiet"
+            if bool(row.get("KleinKleurblok", False)) and gebruik_kleurblok_prioriteit:
+                unplanned_reason[idx] = f"Uitbesteed kandidaat: klein dag-kleurblok (< {kleurblok_drempel_m2:.1f} m²)"
+            else:
+                unplanned_reason[idx] = "Capaciteit/kleur-limiet"
             continue
 
         d = best[1]
@@ -770,29 +884,40 @@ def solve_cpsat(df_in: pd.DataFrame):
         for t in feasible_days_per_order[i]:
             model.Add(z_order_color[((o, c), t)] >= x[(i, t)])
 
-    BIG = 1_000_000
-    W_COLOR = 1000
-    W_ORDER_COLOR_DAY = 20
-    W_ORDER_DAY = 8
-    W_PREF = 1
+    max_changed_orders = max(len(var_idx), 1)
+    max_small_block_assignments = max(sum(1 for i in var_idx if gebruik_kleurblok_prioriteit and bool(dfi.at[i, "KleinKleurblok"])), 1)
+    max_order_day_terms = max(len(order_labels) * T, 1)
+    max_order_color_day_terms = max(len(order_color_labels) * T, 1)
+    max_color_day_terms = max(K * T, 1)
+
+    W_CHANGED_ORDER = 1
+    W_SMALL_BLOCK = max_changed_orders + 1
+    W_ORDER_DAY = max_small_block_assignments * W_SMALL_BLOCK + max_changed_orders + 1
+    W_ORDER_COLOR_DAY = max_order_day_terms * W_ORDER_DAY + max_small_block_assignments * W_SMALL_BLOCK + max_changed_orders + 1
+    W_COLOR = max_order_color_day_terms * W_ORDER_COLOR_DAY + max_order_day_terms * W_ORDER_DAY + max_small_block_assignments * W_SMALL_BLOCK + max_changed_orders + 1
+    BIG = max_color_day_terms * W_COLOR + max_order_color_day_terms * W_ORDER_COLOR_DAY + max_order_day_terms * W_ORDER_DAY + max_small_block_assignments * W_SMALL_BLOCK + max_changed_orders + 1
+
     obj_terms = [BIG * unassigned[i] for i in var_idx]
     obj_terms += [W_COLOR * y[(k, t)] for k in range(K) for t in range(T)]
     obj_terms += [W_ORDER_COLOR_DAY * z_order_color[(oc, t)] for oc in order_color_labels for t in range(T)]
     obj_terms += [W_ORDER_DAY * z_order[(o, t)] for o in order_labels for t in range(T)]
 
     for i in var_idx:
-        pref_latest = dfi.at[i, "VoorkeurLaatsteDag"]
+        old_plan = pd.to_datetime(dfi.at[i, "PlanDatum"], errors="coerce")
+        old_plan_n = old_plan.normalize() if pd.notna(old_plan) else pd.NaT
         for t in feasible_days_per_order[i]:
             d = days[t]
-            if pd.notna(pref_latest) and d > pref_latest:
-                penalty = int((d - pref_latest).days)
-                obj_terms.append(W_PREF * penalty * x[(i, t)])
+            if gebruik_kleurblok_prioriteit and bool(dfi.at[i, "KleinKleurblok"]):
+                obj_terms.append(W_SMALL_BLOCK * x[(i, t)])
+            if pd.notna(old_plan_n) and d != old_plan_n:
+                obj_terms.append(W_CHANGED_ORDER * x[(i, t)])
 
     model.Minimize(sum(obj_terms))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
-    solver.parameters.num_search_workers = 8
+    solver.parameters.num_search_workers = 1
+    solver.parameters.random_seed = 42
     status = solver.Solve(model)
 
     new_dates = {}
@@ -818,6 +943,8 @@ def solve_cpsat(df_in: pd.DataFrame):
             latest = dfi.at[i, "LaatsteToegestaneDag"]
             if pd.notna(earliest) and pd.notna(latest) and earliest > latest:
                 reasons[i] = "Venster ongeldig: vroegste dag ligt na hard deadline"
+            elif bool(dfi.at[i, "KleinKleurblok"]) and gebruik_kleurblok_prioriteit:
+                reasons[i] = f"Uitbesteed kandidaat: klein dag-kleurblok (< {kleurblok_drempel_m2:.1f} m²)"
             else:
                 reasons[i] = "Niet planbaar binnen constraints"
             continue
@@ -862,7 +989,7 @@ LATE_REMOVE_COLS = [
     "ProduktielijnID", "Trav", "Poed", "Omzet", "PlanstatusDefinitief", "M2_Def",
     "Uren_Def", "Trav_Def", "Poed_Def", "Omzet_Def", "Kleurbitmap", "Gereed", "Colli",
     "Vak", "Lgn", "Grond", "Stralen", "StralenGereed", "Poetsen", "PoetsenGereed",
-    "LeverDatumTypeAfkorting", "VoorkeurLaatsteDag", "VroegsteDag",
+    "LeverDatumTypeAfkorting", "VroegsteDag",
     "Regel_AanleverdatumVanToepassing", "HardDeadlineOK", "OrderTypeAfkorting"
 ]
 
@@ -980,6 +1107,15 @@ df["EffectivePlanDag"] = df.apply(
 )
 
 late = build_late_advice(df, late)
+
+uitbesteed_kandidaten = late.copy()
+if len(uitbesteed_kandidaten):
+    uitbesteed_kandidaten = uitbesteed_kandidaten[
+        uitbesteed_kandidaten["KleinKleurblok"].astype(bool)
+    ].copy()
+    uitbesteed_kandidaten["UitbesteedReden"] = (
+        "Klein dag-kleurblok onder drempel; kandidaat om extern te poedercoaten"
+    )
 
 day_base = df[df["EffectivePlanDag"].notna()].copy()
 day_base["Dag"] = day_base["EffectivePlanDag"].dt.normalize()
@@ -1104,32 +1240,59 @@ if len(herpland_actie):
 # ---------- UI ----------
 st.subheader("Samenvatting")
 st.markdown("<div class='planner-caption'>Overzicht van de planning, capaciteit en herplan-acties voor de planner.</div>", unsafe_allow_html=True)
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Totaal orders", len(df))
 c2.metric("Gefixeerd", int(df["Gefixeerd"].sum()))
 c3.metric("Herpland", int(len(herpland)))
 c4.metric("Niet planbaar + advies", int(len(late)))
+c5.metric("Uitbesteed kandidaten", int(len(uitbesteed_kandidaten)))
 
 if overload_days:
     st.warning("⚠️ Gefixeerde orders overschrijden daglimieten op één of meer dagen.")
-    warn_df = pd.DataFrame(overload_days, columns=["Dag", "m2_gefixeerd", "kleuren_gefixeerd", "Cap_m2", "Cap_kleuren"])
-    warn_df["m2_gefixeerd"] = warn_df["m2_gefixeerd"].apply(fmt_m2)
-    warn_df["Cap_m2"] = warn_df["Cap_m2"].apply(fmt_m2)
-    render_df(warn_df, height=220)
 
 with st.expander("Toelichting planningsregels"):
     st.write(f"- **Hard deadline**: plandatum ≤ LeverDatum - {int(min_dagen_voor_lever)} dag(en)")
-    st.write(f"- **Voorkeur buffer**: optimizer probeert plandatum ≤ LeverDatum - {int(pref_dagen_voor_lever)} dag(en)")
     st.write(
         "- **Nieuwe regel**: als **Binnen = waar**, dan is een order direct planbaar. Als **Binnen = onwaar**, dan is de vroegste plandatum **AanleverDatum + 1 dag**."
     )
     st.write("- **Binnen = waar**: order is direct planbaar vanaf de start van de planningshorizon.")
     st.write("- **AanleverDatum** wordt gebruikt voor de vroegste plandatum als **Binnen = onwaar**: **AanleverDatum + 1 dag**.")
 
-resultaat_tab, verplaatskleur_tab, herplan_tab, detail_tab, niet_planbaar_tab, instellingen_tab = st.tabs(
-    ["Resultaat", "Verplaatsblokken op kleur", "Te herplannen orders", "Detailplanning", "Niet planbaar + advies", "Instellingen"]
+resultaat_tab, verplaatskleur_tab, herplan_tab, detail_tab, niet_planbaar_tab, uitbesteed_tab, instellingen_tab, tab_vergelijking = st.tabs(
+    ["Resultaat", "Verplaatsblokken op kleur", "Te herplannen orders", "Detailplanning", "Niet planbaar + advies", "Uitbesteed kandidaten", "Instellingen", "tab_vergelijking"]
 )
+with tab_vergelijking:
 
+    st.subheader("Vergelijking oude vs nieuwe planning")
+
+    kpi_oud = bereken_kpi(df, "OudePlanDatum")
+    kpi_nieuw = bereken_kpi(df, "NieuwePlanDatum")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Oude planning")
+        st.json(kpi_oud)
+
+    with col2:
+        st.markdown("### Nieuwe planning")
+        st.json(kpi_nieuw)
+
+    st.markdown("---")
+
+    pivot_oud = build_kleurpivot(df, "OudePlanDatum")
+    pivot_nieuw = build_kleurpivot(df, "NieuwePlanDatum")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Oude planning")
+        st.dataframe(pivot_oud)
+
+    with col2:
+        st.markdown("### Nieuwe planning")
+        st.dataframe(pivot_nieuw)
+        
 with resultaat_tab:
     st.markdown("### Dagoverzicht")
     dagsamenvatting_view = fmt_df_m2(dagsamenvatting.copy(), ["m2"])
@@ -1246,29 +1409,73 @@ with niet_planbaar_tab:
         b2.metric("Niet planbare orders", int(len(late_full)))
         b3.metric("Niet planbaar m²", fmt_m2(float(late_full["M2"].sum())) if "M2" in late_full.columns and len(late_full) else "0,0")
 
-        if len(adviesblokken):
-            st.markdown("#### Compact adviesoverzicht")
-            adviesblokken_view = adviesblokken.copy()
-            if "LeverDatum" in late_full.columns:
-                lever_range = (
-                    late_full.groupby(grp_cols, dropna=False)["LeverDatum"]
-                    .agg(["min", "max"])
-                    .reset_index()
-                    .rename(columns={"min": "EersteGevraagdeLeverdatum", "max": "LaatsteGevraagdeLeverdatum"})
-                )
-                adviesblokken_view = adviesblokken_view.merge(lever_range, on=grp_cols, how="left")
-            adviesblokken_view = fmt_df_m2(adviesblokken_view, ["m2"])
-            ab_cols = [
-                "Adviesblok", "AdviesActie", "Reden", "Orders", "Kleuren", "m2",
-                "EersteGevraagdeLeverdatum", "LaatsteGevraagdeLeverdatum"
-            ]
-            ab_cols = [c for c in ab_cols if c in adviesblokken_view.columns]
-            render_df(adviesblokken_view[ab_cols], height=340)
-
         with st.expander("Orderdetails tonen (alleen bij uitzondering)", expanded=False):
             late_view = drop_deelorder_columns(compact_late_columns(late_full.copy()))
             late_view = fmt_df_m2(late_view, ["M2"]).sort_values([c for c in ["OudePlanDatum", "AdviesPlanDatum", "LeverDatum", "OrderID"] if c in late_view.columns])
             render_df(late_view, height=420)
+
+        if len(adviesblokken):
+            with st.expander("Compact adviesoverzicht", expanded=False):
+                adviesblokken_view = adviesblokken.copy()
+                if "LeverDatum" in late_full.columns:
+                    lever_range = (
+                        late_full.groupby(grp_cols, dropna=False)["LeverDatum"]
+                        .agg(["min", "max"])
+                        .reset_index()
+                        .rename(columns={"min": "EersteGevraagdeLeverdatum", "max": "LaatsteGevraagdeLeverdatum"})
+                    )
+                    adviesblokken_view = adviesblokken_view.merge(lever_range, on=grp_cols, how="left")
+                adviesblokken_view = fmt_df_m2(adviesblokken_view, ["m2"])
+                ab_cols = [
+                    "Adviesblok", "AdviesActie", "Reden", "Orders", "Kleuren", "m2",
+                    "EersteGevraagdeLeverdatum", "LaatsteGevraagdeLeverdatum"
+                ]
+                ab_cols = [c for c in ab_cols if c in adviesblokken_view.columns]
+                render_df(adviesblokken_view[ab_cols], height=340)
+
+with uitbesteed_tab:
+    st.markdown("### Uitbesteed kandidaten")
+    st.caption("Orders die niet zijn ingepland en onderdeel zijn van een klein dag-kleurblok. Deze lijst is bedoeld als shortlist voor mogelijke externe poedercoating.")
+
+    if len(uitbesteed_kandidaten) == 0:
+        st.success("Geen uitbesteed kandidaten.")
+    else:
+        u1, u2, u3 = st.columns(3)
+        u1.metric("Uitbesteed kandidaten", int(len(uitbesteed_kandidaten)))
+        u2.metric("Totaal uit te besteden m²", fmt_m2(float(uitbesteed_kandidaten["M2"].sum())))
+        u3.metric("Unieke kleuren", int(uitbesteed_kandidaten["Kleur"].nunique()))
+
+        uitbesteed_blokken = (
+            uitbesteed_kandidaten.groupby(["Kleur", "DagKleurblokM2"], dropna=False)
+            .agg(
+                Orders=("OrderID", "count"),
+                m2=("M2", "sum"),
+                EersteLeverdatum=("LeverDatum", "min"),
+                LaatsteLeverdatum=("LeverDatum", "max"),
+                OrderIDs=("OrderID", lambda s: ", ".join(map(str, pd.Series(s).astype(str).tolist()))),
+                ReferentieKlant=("ReferentieKlant", lambda s: ", ".join(sorted(set(pd.Series(s).dropna().astype(str).tolist())))) if "ReferentieKlant" in uitbesteed_kandidaten.columns else ("OrderID", lambda s: ""),
+            )
+            .reset_index()
+            .sort_values(["DagKleurblokM2", "m2"], ascending=[True, False])
+        )
+
+        uitbesteed_blokken_view = fmt_df_m2(uitbesteed_blokken.copy(), ["DagKleurblokM2", "m2"])
+        ub_cols = [
+            "Kleur", "DagKleurblokM2", "Orders", "m2",
+            "EersteLeverdatum", "LaatsteLeverdatum", "ReferentieKlant", "OrderIDs"
+        ]
+        ub_cols = [c for c in ub_cols if c in uitbesteed_blokken_view.columns]
+        render_df(uitbesteed_blokken_view[ub_cols], height=360)
+
+        with st.expander("Orderdetails tonen", expanded=False):
+            uk_view = drop_deelorder_columns(compact_late_columns(uitbesteed_kandidaten.copy()))
+            uk_view = fmt_df_m2(uk_view, ["M2", "DagKleurblokM2"])
+            uk_cols = [
+                "OrderID", "Naam", "ReferentieKlant", "Kleur", "M2",
+                "DagKleurblokM2", "LeverDatum", "Reden", "UitbesteedReden"
+            ]
+            uk_cols = [c for c in uk_cols if c in uk_view.columns]
+            render_df(uk_view[uk_cols], height=420)
 
 with instellingen_tab:
     st.markdown("### Gebruikte instellingen")
@@ -1280,14 +1487,16 @@ with instellingen_tab:
             ("Max m² op vrijdag", friday_max_m2),
             ("Max kleuren op vrijdag", friday_max_kleuren),
             ("Hard buffer vóór leverdatum", min_dagen_voor_lever),
-            ("Voorkeur buffer vóór leverdatum", pref_dagen_voor_lever),
             ("Vroegste dag-regel (indien Binnen = onwaar)", "AanleverDatum + 1 dag"),
             ("Fixeer volgende werkdag", "Ja" if fixeer_morgen else "Nee"),
             ("Fixeer 2e volgende werkdag", "Ja" if fixeer_overmorgen else "Nee"),
             ("Weekenden uitsluiten", "Ja" if exclude_weekends else "Nee"),
             ("Feestdagen/sluitingsdagen uitsluiten", "Ja" if exclude_holidays else "Nee"),
             ("Optimizer", optimizer),
-        ("App versie", APP_VERSION),
+            ("Voorrang grote kleurblokken", "Ja" if gebruik_kleurblok_prioriteit else "Nee"),
+            ("Drempel klein kleurblok (m²)", kleurblok_drempel_m2),
+            ("Kleine kleurblokken hard uitsluiten", "Ja" if harde_uitsluiting_kleine_blokken else "Nee"),
+            ("App versie", APP_VERSION),
             ("Aantal ingestelde feestdagen/sluitingsdagen", len(holidays)),
             ("Persistente instellingenbestand", str(SETTINGS_FILE.name)),
         ],
@@ -1316,7 +1525,7 @@ export_verplaatsblokken_kleur = export_verplaatsblokken_kleur[evbk_cols]
 export_dag = compact_dagoverzicht_columns(normalize_dates(dagsamenvatting.copy()))
 export_kleur = drop_deelorder_columns(normalize_dates(kleurblokken.copy()))
 export_late = drop_deelorder_columns(compact_late_columns(normalize_dates(late.copy())))
-
+export_uitbesteed = drop_deelorder_columns(compact_late_columns(normalize_dates(uitbesteed_kandidaten.copy())))
 
 export_settings = pd.DataFrame(
     [
@@ -1326,13 +1535,15 @@ export_settings = pd.DataFrame(
         ("Max m² op vrijdag", friday_max_m2),
         ("Max kleuren op vrijdag", friday_max_kleuren),
         ("Hard buffer vóór leverdatum", min_dagen_voor_lever),
-        ("Voorkeur buffer vóór leverdatum", pref_dagen_voor_lever),
         ("Vroegste dag-regel (indien Binnen = onwaar)", "AanleverDatum + 1 dag"),
         ("Fixeer volgende werkdag", "Ja" if fixeer_morgen else "Nee"),
         ("Fixeer 2e volgende werkdag", "Ja" if fixeer_overmorgen else "Nee"),
         ("Weekenden uitsluiten", "Ja" if exclude_weekends else "Nee"),
         ("Feestdagen/sluitingsdagen uitsluiten", "Ja" if exclude_holidays else "Nee"),
         ("Optimizer", optimizer),
+        ("Voorrang grote kleurblokken", "Ja" if gebruik_kleurblok_prioriteit else "Nee"),
+        ("Drempel klein kleurblok (m²)", kleurblok_drempel_m2),
+        ("Kleine kleurblokken hard uitsluiten", "Ja" if harde_uitsluiting_kleine_blokken else "Nee"),
         ("App versie", APP_VERSION),
         ("Aantal ingestelde feestdagen/sluitingsdagen", len(holidays)),
         ("Persistente instellingenbestand", str(SETTINGS_FILE.name)),
@@ -1340,6 +1551,40 @@ export_settings = pd.DataFrame(
     ],
     columns=["Instelling", "Waarde"],
 )
+# ===== KPI + PIVOT VOORBEREIDING =====
+
+pivot_oud_export = build_kleurpivot(df, "OudePlanDatum")
+pivot_nieuw_export = build_kleurpivot(df, "NieuwePlanDatum")
+
+kpi_oud = bereken_kpi(df, "OudePlanDatum")
+kpi_nieuw = bereken_kpi(df, "NieuwePlanDatum")
+
+kpi_export = pd.DataFrame([
+    {
+        "KPI": "Totaal kleurwissels",
+        "Oude planning": kpi_oud["kleurwissels"],
+        "Nieuwe planning": kpi_nieuw["kleurwissels"],
+        "Verschil": kpi_nieuw["kleurwissels"] - kpi_oud["kleurwissels"],
+    },
+    {
+        "KPI": "Gem. m2 per kleurblok",
+        "Oude planning": kpi_oud["avg_m2_per_kleur"],
+        "Nieuwe planning": kpi_nieuw["avg_m2_per_kleur"],
+        "Verschil": kpi_nieuw["avg_m2_per_kleur"] - kpi_oud["avg_m2_per_kleur"],
+    },
+    {
+        "KPI": "Aantal kleine blokken",
+        "Oude planning": kpi_oud["kleine_blokken"],
+        "Nieuwe planning": kpi_nieuw["kleine_blokken"],
+        "Verschil": kpi_nieuw["kleine_blokken"] - kpi_oud["kleine_blokken"],
+    },
+    {
+        "KPI": "Fragmentatie",
+        "Oude planning": kpi_oud["fragmentatie"],
+        "Nieuwe planning": kpi_nieuw["fragmentatie"],
+        "Verschil": kpi_nieuw["fragmentatie"] - kpi_oud["fragmentatie"],
+    },
+])
 
 with pd.ExcelWriter(output, engine="openpyxl") as writer:
     export_detail.to_excel(writer, index=False, sheet_name="Resultaat")
@@ -1349,11 +1594,22 @@ with pd.ExcelWriter(output, engine="openpyxl") as writer:
     export_dag.to_excel(writer, index=False, sheet_name="Dagoverzicht")
     export_kleur.to_excel(writer, index=False, sheet_name="Kleurblokken")
     export_late.to_excel(writer, index=False, sheet_name="Niet planbaar advies")
+    export_uitbesteed.to_excel(writer, index=False, sheet_name="Uitbesteed kandidaten")
+    kpi_export.to_excel(writer, index=False, sheet_name="KPI vergelijking")
+
+    if not pivot_oud_export.empty:
+        pivot_oud_export.reset_index().to_excel(writer, index=False, sheet_name="Pivot oude planning")
+
+    if not pivot_nieuw_export.empty:
+        pivot_nieuw_export.reset_index().to_excel(writer, index=False, sheet_name="Pivot nieuwe planning")
+
     export_settings.to_excel(writer, index=False, sheet_name="Instellingen")
+
     if overload_days:
-        pd.DataFrame(overload_days, columns=["Dag", "m2_gefixeerd", "kleuren_gefixeerd", "Cap_m2", "Cap_kleuren"]).to_excel(
-            writer, index=False, sheet_name="Fix-overload"
-        )
+        pd.DataFrame(
+            overload_days,
+            columns=["Dag", "m2_gefixeerd", "kleuren_gefixeerd", "Cap_m2", "Cap_kleuren"]
+        ).to_excel(writer, index=False, sheet_name="Fix-overload")
 
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
